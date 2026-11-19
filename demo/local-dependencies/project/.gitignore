@@ -1,0 +1,7 @@
+/*
+!/.gitignore
+!/.npmrc
+!/package.json
+!/README.md
+!/packages/
+!/packages/**

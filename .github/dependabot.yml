@@ -1,0 +1,70 @@
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  - package-ecosystem: 'npm'
+    directories:
+      - '/'
+      - '/tools/*/'
+    schedule:
+      interval: 'weekly'
+      day: 'saturday'
+    cooldown:
+      default-days: 7
+    allow:
+      - dependency-type: 'all'
+    versioning-strategy: 'auto'
+    labels: [ 'dependencies' ]
+    commit-message:
+      prefix: 'chore'  ## prefix maximum string length of 15
+      include: 'scope'
+    open-pull-requests-limit: 999
+    ignore:
+      - dependency-name: "@types/node"
+        # version is like `ts.X.Y` -- need to maintain manually
+    groups:
+      cyclonedx:
+        patterns:
+          - '@cyclonedx/*'
+      typescript:
+        patterns:
+          - 'typescript'
+          - '@types/*'
+          - 'typedoc'
+          - 'typedoc-*'
+          - '@microsoft/tsdoc'
+          - '@microsoft/tsdoc-*'
+          - 'ts-loader'
+          - 'tslib'
+      eslint:
+        patterns:
+          - 'eslint'
+          - '@eslint/*'
+          - 'eslint-*'
+          - '@eslint-community/*'
+          - 'typescript-eslint'
+          - '@typescript-eslint/*'
+          - '@types/eslint'
+          - '@types/eslint*'
+          - 'neostandard'
+          - 'globals'
+      jest:
+        patterns:
+          - 'jest'
+          - '@jest/*'
+          - 'jest-*'
+          - 'babel-jest'
+          - '@types/jest'
+          - '@types/jest*'
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+      day: 'saturday'
+    cooldown:
+      default-days: 7
+    labels: [ 'dependencies' ]
+    commit-message:
+      prefix: 'chore'   ## prefix maximum string length of 15
+      include: 'scope'
+    open-pull-requests-limit: 999

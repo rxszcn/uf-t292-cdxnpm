@@ -1,0 +1,447 @@
+/*!
+This file is part of CycloneDX generator for NPM projects.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) OWASP Foundation. All Rights Reserved.
+*/
+
+import {closeSync, existsSync, mkdirSync, openSync} from 'node:fs'
+import {dirname, resolve} from 'node:path'
+
+import {
+  Builders as FromNodePackageJsonBuilders,
+  Factories as FromNodePackageJsonFactories
+} from '@cyclonedx/cyclonedx-library/Contrib/FromNodePackageJson'
+import {Factories as LicenseFactories, Utils as LicenseUtils} from '@cyclonedx/cyclonedx-library/Contrib/License'
+import {ComponentType} from '@cyclonedx/cyclonedx-library/Enums'
+import {
+  JSON as SerializeJSON,
+  JsonSerializer,
+  MissingOptionalDependencyError as SerializationMissingOptionalDependencyError,
+  XML as SerializeXML,
+  XmlSerializer
+} from '@cyclonedx/cyclonedx-library/Serialize'
+import {SpecVersionDict, Version as SpecVersion} from '@cyclonedx/cyclonedx-library/Spec'
+import type {Types as ValidationTypes} from '@cyclonedx/cyclonedx-library/Validation'
+import {JsonStrictValidator, XmlValidator} from '@cyclonedx/cyclonedx-library/Validation'
+import {Argument, Command, Option} from 'commander'
+import spdxExpressionParse from "spdx-expression-parse"
+
+import {loadJsonFile, type Version, versionCompare, versionTuple, writeAllSync} from './_helpers'
+import {BomBuilder, TreeBuilder} from './builders'
+import {PackageUrlFactory} from "./factories";
+import {makeConsoleLogger} from './logger'
+import {NpmRunner} from './npmRunner'
+
+
+enum OutputFormat {
+  JSON = 'JSON',
+  XML = 'XML',
+}
+
+enum Omittable {
+  Dev = 'dev',
+  Optional = 'optional',
+  Peer = 'peer',
+}
+
+const OutputStdOut = '-'
+
+interface CommandOptions {
+  ignoreNpmErrors: boolean
+  packageLockOnly: boolean
+  omit: Omittable[]
+  workspace: string[]
+  includeWorkspaceRoot: boolean | undefined
+  workspaces: boolean | undefined
+  gatherLicenseTexts: boolean
+  flattenComponents: boolean
+  shortPURLs: boolean
+  outputReproducible: boolean
+  specVersion: SpecVersion
+  outputFormat: OutputFormat
+  outputFile: string
+  validate: boolean | undefined
+  mcType: ComponentType
+  verbose: number
+}
+
+function makeCommand(process_: NodeJS.Process): Command {
+  return new Command(
+    /* auto-set the name */
+  ).description(
+    'Create CycloneDX Software Bill of Materials (SBOM) from Node.js NPM projects.'
+  ).usage(
+    // Need to add the `[--]` manually, to indicate how to stop a variadic option.
+    '[options] [--] [<package-manifest>]'
+  ).version(
+    // that is supposed to be the last option in the list on the help page.
+    /* eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion, @typescript-eslint/no-unsafe-member-access -- ack */
+    loadJsonFile(resolve(module.path, '..', 'package.json')).version as string
+  ).addOption(
+    new Option(
+      '--ignore-npm-errors',
+      'Whether to ignore errors of NPM.\n' +
+      'This might be used, if "npm install" was run with "--force" or "--legacy-peer-deps".'
+    ).default(false)
+  ).addOption(
+    new Option(
+      '--package-lock-only',
+      'Whether to only use the lock file, ignoring "node_modules".\n' +
+      'This means the output will be based only on the few details in and the tree described by the "npm-shrinkwrap.json" or "package-lock.json", rather than the contents of "node_modules" directory.'
+    ).default(false)
+  ).addOption(
+    new Option(
+      '--omit <type...>',
+      'Dependency types to omit from the installation tree.' +
+      ' (can be set multiple times)'
+    ).choices(
+      Object.values(Omittable).sort()
+    ).default(
+      process_.env.NODE_ENV === 'production'
+        ? [Omittable.Dev]
+        : [],
+      `"${Omittable.Dev}" if the NODE_ENV environment variable is set to "production", otherwise empty`
+    )
+  ).addOption(
+    new Option(
+      '-w, --workspace <workspace...>',
+      'Only include dependencies for specific workspaces.' +
+      ' (can be set multiple times)' +
+      '\nThis feature is experimental.'
+    ).default([], 'empty')
+  ).addOption(
+    new Option(
+      '--no-workspaces',
+      'Do not include dependencies for workspaces.\n' +
+      'Default behaviour is to include dependencies for all configured workspaces.\n' +
+      'This cannot be used if workspaces have been explicitly defined using `--workspace`.' +
+      '\nThis feature is experimental.'
+    ).default(
+      undefined
+    ).conflicts('workspace')
+  ).addOption(
+    new Option(
+      '--include-workspace-root',
+      "Include workspace root dependencies along with explicitly defined workspaces' dependencies. " +
+      'This can only be used if you have explicitly defined workspaces using `--workspace`.\n' +
+      'Default behaviour is to not include the workspace root when workspaces are explicitly defined using `--workspace`.' +
+      '\nThis feature is experimental.'
+    ).default(undefined)
+  ).addOption(
+    new Option(
+      '--no-include-workspace-root',
+      'Do not include workspace root dependencies. ' +
+      'This only has an effect if you have one or more workspaces configured in your project.\n' +
+      'This is useful if you want to include all dependencies for all workspaces without explicitly defining them with `--workspace` (default behaviour) but you do not want the workspace root dependencies included.' +
+      '\nThis feature is experimental.'
+    ).default(undefined)
+  ).addOption(
+    new Option(
+      '--gather-license-texts',
+      'Search for license files in components and include them as license evidence.' +
+      '\nThis feature is experimental.'
+    ).default(false)
+  ).addOption(
+    new Option(
+      '--flatten-components',
+      'Whether to flatten the components.\n' +
+      'This means the actual nesting of node packages is not represented in the SBOM result.'
+    ).default(false)
+  ).addOption(
+    new Option(
+      '--short-PURLs',
+      'Omit all qualifiers from PackageURLs.\n' +
+      'This causes information loss in trade-off shorter PURLs, which might improve ingesting these strings.'
+    ).default(false)
+  ).addOption(
+    new Option(
+      '--sv, --spec-version <version>',
+      'Which version of CycloneDX spec to use.'
+    ).choices(
+      Object.keys(SpecVersionDict).sort()
+    ).default(
+      SpecVersion.v1dot7
+    )
+  ).addOption(
+    new Option(
+      '--output-reproducible',
+      'Whether to go the extra mile and make the output reproducible.\n' +
+      'This requires more resources, and might result in loss of time- and random-based-values.'
+    ).env(
+      'BOM_REPRODUCIBLE'
+    )
+  ).addOption(
+    (() => {
+      const o = new Option(
+        '--of, --output-format <format>',
+        'Which output format to use.\n'
+        + 'XML serialization fail, if requirements not met - see the README.'
+      ).choices(
+        Object.values(OutputFormat).sort()
+      ).default(
+        // the context is node/JavaScript - which should prefer JSON
+        OutputFormat.JSON
+      )
+      const oldParseArg = o.parseArg ?? // might do input validation on choices, etc...
+        (v => v) // fallback: pass-through
+      /* @ts-expect-error TS2304 */
+      o.parseArg = (v, p) => oldParseArg(v.toUpperCase(), p)
+      return o
+    })()
+  ).addOption(
+    new Option(
+      '-o, --output-file <file>',
+      'Path to the output file.\n' +
+      `Set to "${OutputStdOut}" to write to STDOUT.`
+    ).default(
+      OutputStdOut,
+      'write to STDOUT'
+    )
+  ).addOption(
+    new Option(
+      '--validate',
+      'Validate resulting BOM before outputting.\n' +
+      'Process fails if requirements not met - see the README.'
+    ).default(undefined)
+  ).addOption(
+    new Option(
+      '--no-validate',
+      'Disable validation of resulting BOM.'
+    )
+  ).addOption(
+    new Option(
+      '--mc-type <type>',
+      'Type of the main component.'
+    ).choices(
+      // Object.values(Enums.ComponentType) -- use all possible values
+      [ // for the NPM context only the following make sense:
+        ComponentType.Application,
+        ComponentType.Firmware,
+        ComponentType.Library
+      ].sort()
+    ).default(ComponentType.Application)
+  ).addOption(
+    new Option(
+      '-v, --verbose',
+      'Increase the verbosity of messages.\n' +
+      'Use multiple times to increase the verbosity even more.'
+    ).argParser<number>(
+      (_, previous) => previous + 1
+    ).default(0)
+  ).addArgument(
+    new Argument(
+      '[<package-manifest>]',
+      "Path to project's manifest file."
+    ).default(
+      'package.json',
+      '"package.json" file in current working directory'
+    )
+  ).allowExcessArguments(
+    false
+  )
+}
+
+const enum ExitCode {
+  SUCCESS = 0, // all good
+  FAILURE = 1, // something went wrong
+  INVALID = 2, // invalid options or setup
+}
+
+const npmMinVersion: Version = Object.freeze([9, 0, 0])
+
+/* eslint-disable-next-line complexity -- ack */
+export async function run(process_: NodeJS.Process): Promise<number> {
+  process_.title = 'cyclonedx-node-npm' /* eslint-disable-line  no-param-reassign -- ack */
+
+  const program = makeCommand(process_)
+  program.parse(process_.argv)
+
+  const options: CommandOptions = program.opts()
+  const myConsole = makeConsoleLogger(process_, options.verbose)
+  myConsole.debug('DEBUG | options: %j', options)
+  myConsole.debug('DEBUG | args: %j', program.args)
+
+  const npmRunner = new NpmRunner(process_, myConsole)
+  const npmVersion = npmRunner.getVersion({env: process_.env})
+  if (versionCompare(versionTuple(npmVersion), npmMinVersion) < 0) {
+    throw new RangeError('Unsupported NPM version. ' +
+      `Expected >= ${npmMinVersion.join('.')}, got ${npmVersion}`)
+  }
+  myConsole.debug('DEBUG | found NPM version %j', npmVersion)
+
+  // Commander will default this option to true as there
+  // is no positive boolean parameter (we define --no-workspaces but
+  // no --workspaces).
+  if (options.workspaces === true) {
+    options.workspaces = undefined
+  }
+
+  if (options.includeWorkspaceRoot === true && options.workspace.length === 0) {
+    throw new Error(
+      "option '--include-workspace-root' cannot be used without option '-w, --workspace <workspace...>'")
+  }
+
+  const packageFile = resolve(process_.cwd(), program.args[0] ?? 'package.json')
+  if (!existsSync(packageFile)) {
+    throw new Error(`missing project's manifest file: ${packageFile}`)
+  }
+  myConsole.debug('DEBUG | packageFile:', packageFile)
+  const projectDir = dirname(packageFile)
+  myConsole.info('INFO  | projectDir:', projectDir)
+
+  if (existsSync(resolve(projectDir, 'npm-shrinkwrap.json'))) {
+    myConsole.info('INFO  | detected a npm shrinkwrap file')
+  } else if (existsSync(resolve(projectDir, 'package-lock.json'))) {
+    myConsole.info('INFO  | detected a package lock file')
+  } else if (!options.packageLockOnly && existsSync(resolve(projectDir, 'node_modules'))) {
+    myConsole.info('INFO  | detected a `node_modules` dir')
+    // npm7 and later also might put a `node_modules/.package-lock.json` file
+  } else {
+    myConsole.warn('WARN  | ? Did you forget to run `npm install` on your project accordingly ?')
+    myConsole.error('ERROR | No evidence: no package lock file nor npm shrinkwrap file')
+    if (!options.packageLockOnly) {
+      myConsole.error('ERROR | No evidence: no `node_modules` dir')
+    }
+    throw new Error('missing evidence')
+  }
+
+  if (options.gatherLicenseTexts && options.packageLockOnly) {
+    myConsole.warn('WARN  | Adding license text is ignored (package-lock-only is configured!)')
+    options.gatherLicenseTexts = false
+  }
+
+  myConsole.log('LOG   | gathering BOM data ...')
+  const bom = new BomBuilder(
+    npmRunner,
+    new FromNodePackageJsonBuilders.ComponentBuilder(
+      new FromNodePackageJsonFactories.ExternalReferenceFactory(),
+      new LicenseFactories.LicenseFactory(spdxExpressionParse)
+    ),
+    new TreeBuilder(),
+    new PackageUrlFactory(),
+    new LicenseUtils.LicenseEvidenceGatherer(),
+    {
+      ignoreNpmErrors: options.ignoreNpmErrors,
+      metaComponentType: options.mcType,
+      packageLockOnly: options.packageLockOnly,
+      omitDependencyTypes: options.omit,
+      gatherLicenseTexts: options.gatherLicenseTexts,
+      reproducible: options.outputReproducible,
+      flattenComponents: options.flattenComponents,
+      shortPURLs: options.shortPURLs,
+      workspace: options.workspace,
+      includeWorkspaceRoot: options.includeWorkspaceRoot,
+      workspaces: options.workspaces
+    },
+    myConsole
+  ).buildFromProjectDir(projectDir, process_)
+
+  const spec = SpecVersionDict[options.specVersion]
+  if (undefined === spec) {
+    throw new Error('unsupported spec-version')
+  }
+
+  /* eslint-disable-next-line  @typescript-eslint/init-declarations -- needed */
+  let serializer: JsonSerializer | XmlSerializer
+  /* eslint-disable-next-line  @typescript-eslint/init-declarations -- needed */
+  let validatorClass: typeof JsonStrictValidator | typeof XmlValidator
+  switch (options.outputFormat) {
+    case OutputFormat.JSON:
+      serializer = new JsonSerializer(new SerializeJSON.Normalize.Factory(spec))
+      validatorClass = JsonStrictValidator
+      break
+    case OutputFormat.XML:
+      serializer = new XmlSerializer(new SerializeXML.Normalize.Factory(spec))
+      validatorClass = XmlValidator
+      break
+  }
+
+  myConsole.log('LOG   | serializing BOM ...')
+  /* eslint-disable-next-line @typescript-eslint/init-declarations -- ack */
+  let serialized: string
+  try {
+    serialized = serializer.serialize(bom, {
+      sortLists: options.outputReproducible,
+      space: 2
+    })
+  } catch (err) {
+    if (err instanceof SerializationMissingOptionalDependencyError) {
+      myConsole.debug('DEBUG | cannot serialize BOM. details:', err)
+      myConsole.error('ERROR | cannot serialize BOM.')
+    } else {
+      myConsole.debug('DEBUG | unexpected serialization error. details:', err)
+      myConsole.error('ERROR | unexpected serialization error')
+    }
+    throw err
+  }
+
+  if (options.validate === false) {
+    // validation is forbidden
+  } else if (validatorClass.cannot === false) {
+    // validation can and should act
+    /* eslint-disable-next-line new-cap -- ack  */
+    const validator: ValidationTypes.Validator = new validatorClass(spec.version)
+    myConsole.log('LOG   | validating BOM result ...')
+    /* eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- ack  */
+    const validationErrors = await validator.validate(serialized)
+    if (validationErrors !== null) {
+      myConsole.debug('DEBUG | BOM result invalid. details: ', validationErrors)
+      myConsole.error('ERROR | Failed to generate valid BOM.')
+      myConsole.warn(
+        'WARN  | Please report the issue and provide the npm lock file of the current project to:\n' +
+        '      | https://github.com/CycloneDX/cyclonedx-node-npm/issues/new?template=ValidationError-report.md&labels=ValidationError&title=%5BValidationError%5D')
+      return ExitCode.FAILURE
+    }
+    myConsole.info('INFO  | BOM result appears valid')
+  } else {
+    // cannot validate
+    if (options.validate === true) {
+      // validation is enforced -> error
+      myConsole.debug('DEBUG | cannot validate BOM. details:', validatorClass.cannot.message)
+      myConsole.error('ERROR | cannot validate BOM.')
+      return ExitCode.INVALID
+    }
+    // validation is optional -> skip
+    myConsole.debug('DEBUG | skip validate BOM. details:', validatorClass.cannot.message)
+    myConsole.info('INFO  | skip validate BOM.')
+  }
+
+  let outputFD: number = process_.stdout.fd
+  if (options.outputFile !== OutputStdOut) {
+    const outputFPn = resolve(process_.cwd(), options.outputFile)
+    myConsole.debug('DEBUG | outputFPn:', outputFPn)
+    const outputFDir = dirname(outputFPn)
+    if (!existsSync(outputFDir)) {
+      myConsole.info('INFO  | creating directory', outputFDir)
+      mkdirSync(outputFDir, {recursive: true})
+    }
+    outputFD = openSync(outputFPn, 'w')
+  }
+
+  try {
+    myConsole.log('LOG   | writing BOM to: %s', options.outputFile)
+    const written = await writeAllSync(outputFD, serialized)
+    myConsole.info('INFO  | wrote %d bytes to %s', written, options.outputFile)
+
+    return written > 0
+      ? ExitCode.SUCCESS
+      : ExitCode.FAILURE
+  } finally {
+    if (outputFD !== process_.stdout.fd) {
+      closeSync(outputFD)
+    }
+  }
+}

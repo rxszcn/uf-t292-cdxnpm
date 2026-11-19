@@ -1,0 +1,20 @@
+{
+  "name": "demo-dev-dependencies",
+  "description": "demo: demo-dev-dependencies -- showcase how devDependencies look like",
+  "private": true,
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CycloneDX/cyclonedx-node-npm.git",
+    "directory": "demo/dev-dependencies/project"
+  },
+  "optionalDependencies": {
+    "uuidv4": "6.2.13"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.10",
+    "@types/uuid": "8.3.4",
+    "uuid": "8.3.2"
+  }
+}

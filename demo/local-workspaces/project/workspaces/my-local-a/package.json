@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "name": "my-local-a",
+  "version": "0.1.0",
+  "description": "demo: my-local-a",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitlab.example.com/my-packages/demo-workspaces.git",
+    "directory": "workspaces/my-local-c"
+  },
+  "dependencies": {
+    "my-local-b-off": "*"
+  }
+}

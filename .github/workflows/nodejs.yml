@@ -1,0 +1,323 @@
+# For details of what checks are run for PRs please refer below
+# docs: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions
+
+name: Node CI
+
+on:
+  push:
+    branches: [ 'main', 'master', 'next' ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # schedule daily tests, since dependencies are not intended to be locked
+    # this means: at 23:42 every day
+    - cron: '42 23 * * *'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+permissions: { }
+
+env:
+  NODE_ACTIVE_LTS: '24'  # https://nodejs.org/en/about/releases/
+  DIST_DIR: dist
+  REPORTS_DIR: "CI_reports"
+  TESTS_REPORTS_ARTIFACT: tests-reports
+  CNPM_TEST_UPDATE_SNAPSHOTS: ''  # set to a string that nodeJS would not evaluate to TRUE - which can only be an empty string
+
+
+defaults:
+  run:
+    shell: bash # don't want to write tht code twice, windows and unix-like
+
+jobs:
+  build:
+    name: build
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        # see https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js ${{ env.NODE_ACTIVE_LTS }}
+        # see https://github.com/actions/setup-node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: ${{ env.NODE_ACTIVE_LTS }}
+          package-manager-cache: false
+      - name: setup subject
+        run: npm i --ignore-scripts --loglevel=silly
+      - name: build
+        run: npm run build-dev
+      - name: artifact build result
+        # see https://github.com/actions/upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.DIST_DIR }}
+          path: ${{ env.DIST_DIR }}
+          if-no-files-found: error
+
+  test-standard:
+    name: test standard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        # see https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js ${{ env.NODE_ACTIVE_LTS }}
+        # see https://github.com/actions/setup-node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: ${{ env.NODE_ACTIVE_LTS }}
+          package-manager-cache: false
+      - name: setup project
+        run: |
+          npm install --ignore-scripts --loglevel=silly
+      - name: setup tools
+        run: |
+          echo "::group::install code-style deps"
+          npm run -- dev-setup:tools:code-style --ignore-scripts --loglevel=silly
+          echo "::endgroup::"
+      - name: make reports dir
+        run: mkdir -p "$REPORTS_DIR"
+      - name: test
+        run: >
+          npm run -- test:standard
+          --format json
+          --output-file "$PWD/$REPORTS_DIR/eslint.json"
+      - name: Annotate Code
+        if: ${{ failure() || success() }}
+        # see https://github.com/DerLev/eslint-annotations
+        uses: DerLev/eslint-annotations@a79ea65c1b45a649c48bcc6efc0103b6fd2e4c5f # v2.1.0
+        with:
+          eslint-report: ${{ env.REPORTS_DIR }}/eslint.json
+      - name: artifact eslint result
+        # see https://github.com/actions/upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ failure() }}
+        with:
+          name: ${{ env.STANDARD_REPORTS_ARTIFACT }}
+          path: ${{ env.REPORTS_DIR }}
+          if-no-files-found: error
+
+  test-dependencies:
+    name: test dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        # see https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js ${{ env.NODE_ACTIVE_LTS }}
+        # see https://github.com/actions/setup-node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: ${{ env.NODE_ACTIVE_LTS }}
+          package-manager-cache: false
+      - name: setup project
+        run: npm install --ignore-scripts --loglevel=silly
+      - name: setup tools
+        run: npm run -- dev-setup:tools:test-dependencies --ignore-scripts --loglevel=silly
+      - name: test
+        run: npm run -- test:dependencies -d
+
+  test-jest:
+    needs: [ 'build' ]
+    name: >
+      jest
+      node${{ matrix.node-version }}
+      ${{ matrix.os }}
+      ${{ (matrix.experimental == true) && '[experimental]' || '' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          ## action based on https://github.com/actions/node-versions/releases
+          ## see also: https://nodejs.org/en/about/releases/
+          - '26'      # Current
+          - '24'      # active LTS
+          - '22'
+          - '20'
+          - '20.18.0' # lowest supported
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        # include:
+        #  - node-version: "27"
+        #    experimental: true
+    env:
+      NODE_VERSION: ${{ matrix.node-version }}
+      OS: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        # see https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        # see https://github.com/actions/setup-node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: npm version
+        run: npm --version
+      - name: setup subject
+        run: |  # zizmor: ignore[adhoc-packages] -- npm install partially with locked
+          npm i --ignore-scripts --loglevel=silly
+          ## install ([transitive] optional peer) deps
+          npm i --no-save --loglevel=silly 'libxmljs2@^0.35||^0.37' \
+            || npm uninstall --no-save libxmljs2 || true
+      - name: fetch build artifact
+        # see https://github.com/actions/download-artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.DIST_DIR }}
+          path: ${{ env.DIST_DIR }}
+      - name: setup-tests
+        run: npm run setup-tests
+      - name: test
+        run: npm run test:jest
+        env:
+          JEST_JUNIT_OUTPUT_DIR: '${{ env.REPORTS_DIR }}/node${{ env.NODE_VERSION }}_${{ env.OS }}'
+      - name: artifact test logs
+        if: ${{ failure() }}
+        # see https://github.com/actions/upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-jest_node${{ env.NODE_VERSION }}_${{ env.OS }}
+          path: tests/_log
+          if-no-files-found: error
+      - name: collect coverage
+        if: ${{ failure() || success() }}
+        run: >
+          node -- node_modules/c8/bin/c8.js
+          report
+          --reporter clover
+          --reports-dir "${REPORTS_DIR}/node${NODE_VERSION}_${OS}/coverage"
+      - name: artifact test reports
+        if: ${{ ! cancelled() }}
+        # see https://github.com/actions/upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: '${{ env.TESTS_REPORTS_ARTIFACT }}_node${{ env.NODE_VERSION }}_${{ env.OS }}'
+          path: ${{ env.REPORTS_DIR }}
+
+  dogfooding:
+    needs: [ 'build' ]
+    name: dogfooding npm ${{ matrix.npm-version }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - npm-version: latest
+            os: ubuntu-latest
+          - npm-version: latest
+            os: windows-latest
+          - npm-version: latest
+            os: macos-latest
+          - npm-version: '^11'
+            node-version: '^24'
+            os: ubuntu-latest
+          - npm-version: '^10'
+            node-version: '^20.18'
+            os: ubuntu-latest
+          - npm-version: '^9'
+            node-version: '^20.18'
+            os: ubuntu-latest
+    env:
+      NPM_VERSION: ${{ matrix.npm-version }}
+      NODE_VERSION: ${{ matrix.node-version }}
+      npm_config_engine_strict: true
+    timeout-minutes: 10
+    steps:
+      - name: NODE_VERSION fallback to NODE_ACTIVE_LTS
+        run: |
+          if test -z "$NODE_VERSION"
+          then
+            echo "NODE_VERSION=${NODE_ACTIVE_LTS}" >> "$GITHUB_ENV"
+          fi
+      - name: Checkout
+        # see https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: make REPORTS_DIR
+        run: mkdir -p "$REPORTS_DIR"
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        # see https://github.com/actions/setup-node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: setup npm ${{ env.NPM_VERSION }}
+        run: |  # zizmor: ignore[adhoc-packages] -- global npm
+          npm i -g "npm@${NPM_VERSION}"
+          npm --version
+      - name: setup subject
+        run: |  # zizmor: ignore[adhoc-packages] -- npm install partially with locked 
+          npm i --ignore-scripts --omit=dev --omit=peer --only=prod --production --loglevel=silly
+          ## install ([transitive] optional peer) deps
+          npm i --no-save --ignore-scripts --omit=dev --omit=peer --loglevel=silly \
+            ajv ajv-formats ajv-formats-draft2019
+      - name: fetch build artifact
+        # see https://github.com/actions/download-artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.DIST_DIR }}
+          path: ${{ env.DIST_DIR }}
+      - name: dogfooding
+        run: >
+          node -- bin/cyclonedx-npm-cli.js
+          -vvv
+          --ignore-npm-errors
+          --omit=dev
+          --output-file="${REPORTS_DIR}/bom.json"
+      - name: artifact test reports
+        if: ${{ failure() }}
+        # see https://github.com/actions/upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dogfooding-direct_npm${{ env.NPM_VERSION }}
+          path: ${{ env.REPORTS_DIR }}
+          if-no-files-found: error
+
+  report-coverage:
+    name: Publish test coverage
+    needs:
+      - test-jest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: fetch test artifacts
+        # see https://github.com/actions/download-artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: '${{ env.TESTS_REPORTS_ARTIFACT }}_*'
+          merge-multiple: true
+          path: ${{ env.REPORTS_DIR }}
+      - name: Run codacy-coverage-reporter
+        env:
+          CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+        ## see https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#example-using-secrets
+        if: ${{ env.CODACY_PROJECT_TOKEN != '' }}
+        # see https://github.com/codacy/codacy-coverage-reporter-action
+        uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
+        with:
+          project-token: ${{ env.CODACY_PROJECT_TOKEN }}
+          coverage-reports: ${{ env.REPORTS_DIR }}/*/coverage/*
+
